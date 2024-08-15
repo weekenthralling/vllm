@@ -87,6 +87,8 @@ def sample_sharegpt_requests(
     dataset_path: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
+    range_ratio: float = 0.9,
+    fixed_input_len: Optional[int] = None,
     fixed_output_len: Optional[int] = None,
 ) -> List[Tuple[str, int, int, None]]:
     if fixed_output_len is not None and fixed_output_len < 4:
@@ -117,6 +119,14 @@ def sample_sharegpt_requests(
         prompt_len = len(prompt_token_ids)
         output_len = len(completion_token_ids
                          ) if fixed_output_len is None else fixed_output_len
+
+        if fixed_input_len is not None:
+            min_input_len = fixed_input_len * range_ratio
+            max_input_len = fixed_input_len * (2 - range_ratio)
+            if min_input_len <= prompt_len <= max_input_len:
+                filtered_dataset.append((prompt, prompt_len, output_len))
+            continue
+
         if prompt_len < 4 or output_len < 4:
             # Prune too short sequences.
             continue
@@ -612,6 +622,7 @@ def main(args: argparse.Namespace):
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
+            fixed_input_len=args.sharegpt_input_len,
             fixed_output_len=args.sharegpt_output_len,
         )
 
@@ -798,6 +809,13 @@ if __name__ == "__main__":
         type=int,
         default=1000,
         help="Number of prompts to process.",
+    )
+    parser.add_argument(
+        "--sharegpt-input-len",
+        type=int,
+        default=None,
+        help="Input length for each request. Overrides the input length "
+        "from the ShareGPT dataset.",
     )
     parser.add_argument(
         "--logprobs",
