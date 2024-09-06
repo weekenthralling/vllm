@@ -557,6 +557,179 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+def benchmark_one_by_one(
+    api_url: str,
+    model_id: str,
+    input_requests: List[Tuple[Any, int, int]],
+    disable_tqdm: bool,
+) -> None:
+    """This function is used to benchmark the serving throughput of the vLLM API server.
+    It sends one request at a time and measures the end-to-end latency per request.
+    It is useful to measure the latency of the server when handling a single request.
+    """
+
+    def send_request(prompt, output_len) -> RequestFuncOutput:
+        import requests
+
+        payload = {
+            "model": model_id,
+            "messages": (
+                [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    },
+                ]
+                if isinstance(prompt, str)
+                else prompt
+            ),
+            "temperature": 0.0,
+            "max_tokens": output_len,
+            "stream": False,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+        }
+
+        start_time = time.perf_counter()
+        response = requests.post(api_url, json=payload, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            return RequestFuncOutput(
+                success=True,
+                latency=time.perf_counter() - start_time,
+                generated_text=data["choices"][0]["message"]["content"],
+                prompt_len=data["usage"]["prompt_tokens"],
+                output_len=data["usage"]["completion_tokens"],
+            )
+        else:
+            return RequestFuncOutput(
+                success=False,
+                error=f"Request failed with status code: {response.status_code}",
+            )
+
+    print("Starting initial single prompt test run...")
+    test_prompt, _, test_output_len = input_requests[0]
+    test_output = send_request(prompt=test_prompt, output_len=test_output_len)
+    if not test_output.success:
+        raise ValueError(
+            "Initial test run failed - Please make sure benchmark arguments "
+            f"are correctly specified. Error: {test_output.error}"
+        )
+    else:
+        print("Initial test run completed. Starting main benchmark run...")
+
+    outputs: List[RequestFuncOutput] = []
+    with tqdm(total=len(input_requests), disable=disable_tqdm) as pbar:
+        for _request, _, output_len in input_requests:
+            outputs.append(send_request(prompt=_request, output_len=output_len))
+            pbar.update(1)
+
+    calculate_one_by_one_metrics(outputs)
+
+
+def calculate_one_by_one_metrics(outputs: List[RequestFuncOutput]) -> None:
+    """This function is used to calculate the metrics of the benchmark run
+    when using the `benchmark_one_by_one` function.
+    """
+
+    import pandas as pd
+
+    # Define input and output bins (intervals) from 0 to 2048, with steps of 128
+    prompt_bins = np.arange(0, 2048 + 1, 128)
+    output_bins = np.arange(0, 2048 + 1, 128)
+
+    # Dictionary to store aggregated statistics per interval
+    stat_dict = {}
+
+    # Iterate over each object in the list and collect statistics
+    for output in outputs:
+        if output.success:  # Only consider successful requests
+            # Determine which interval the prompt_len and output_len fall into
+            prompt_bin = np.digitize([output.prompt_len], prompt_bins)[0] - 1
+            output_bin = np.digitize([output.output_len], output_bins)[0] - 1
+
+            # Ensure indices are within the bounds
+            prompt_bin = max(0, min(prompt_bin, len(prompt_bins) - 2))
+            output_bin = max(0, min(output_bin, len(output_bins) - 2))
+
+            # Construct interval ranges for both input (prompt) and output
+            prompt_range = f"{prompt_bins[prompt_bin]}-{prompt_bins[prompt_bin + 1]}"
+            output_range = f"{output_bins[output_bin]}-{output_bins[output_bin + 1]}"
+
+            # Create a unique key based on the input/output intervals
+            key = (prompt_range, output_range)
+
+            # Initialize statistics for this key if not already present
+            if key not in stat_dict:
+                stat_dict[key] = {
+                    "samples": 0,
+                    "total_latency": 0.0,
+                    "total_prompt_len": 0,
+                    "total_output_len": 0,
+                }
+
+            # Update statistics for this interval
+            stat_dict[key]["samples"] += 1
+            stat_dict[key]["total_latency"] += output.latency
+            stat_dict[key]["total_prompt_len"] += output.prompt_len
+            stat_dict[key]["total_output_len"] += output.output_len
+
+    # Prepare a table to store the final results
+    table = []
+    for key, data in stat_dict.items():
+        prompt_range, output_range = key
+        samples = data["samples"]
+
+        # Calculate average request latency for the interval
+        avg_latency = data["total_latency"] / samples if samples > 0 else 0
+
+        # Calculate token latency (latency per token) as latency / (input + output tokens)
+        total_tokens = data["total_prompt_len"] + data["total_output_len"]
+        token_latency = (
+            data["total_latency"] * 1000 / total_tokens if total_tokens > 0 else 0
+        )
+        output_token_latency = (
+            data["total_latency"] * 1000 / data["total_output_len"]
+            if data["total_output_len"] > 0
+            else 0
+        )
+
+        # Append the results for this interval to the table
+        table.append(
+            [
+                prompt_range,
+                output_range,
+                samples,
+                avg_latency,
+                token_latency,
+                output_token_latency,
+            ]
+        )
+
+    # Convert the result table into a DataFrame for better readability
+    df = pd.DataFrame(
+        table,
+        columns=[
+            "Input Length",
+            "Output Length",
+            "Samples",
+            "Request Latency (s/req)",
+            "Token Latency (ms/token)",
+            "Output Token Latency  (ms/token)",
+        ],
+    )
+
+    # Simplified sorting by using key in sort_values
+    df = df.sort_values(
+        by=["Input Length", "Output Length"],
+        key=lambda col: col.str.extract(r"(\d+)", expand=False).astype(int),
+    )
+
+    print(df.to_markdown(index=False))
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -917,8 +1090,17 @@ def main(args: argparse.Namespace):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
-    gootput_config_dict = check_goodput_args(args)
+    if args.one_by_one:
+        print("Running benchmark one by one...")
+        benchmark_one_by_one(
+            api_url=api_url,
+            model_id=model_id,
+            input_requests=input_requests,
+            disable_tqdm=args.disable_tqdm,
+        )
+        return
 
+    gootput_config_dict = check_goodput_args(args)
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
@@ -1284,5 +1466,10 @@ if __name__ == "__main__":
         'always use the slow tokenizer. \n* '
         '"mistral" will always use the `mistral_common` tokenizer.')
 
+    parser.add_argument(
+        "--one-by-one",
+        action="store_true",
+        help="benchmark one by one, instead of running all requests at once.",
+    )
     args = parser.parse_args()
     main(args)
