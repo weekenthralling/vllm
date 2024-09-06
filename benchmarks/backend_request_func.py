@@ -4,7 +4,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import aiohttp
 import huggingface_hub.constants
@@ -17,7 +17,7 @@ AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 @dataclass
 class RequestFuncInput:
-    prompt: str
+    prompt: Any
     api_url: str
     prompt_len: int
     output_len: int
@@ -39,6 +39,7 @@ class RequestFuncOutput:
         default_factory=list)  # List of inter-token latencies
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
+    output_len: int = 0
     error: str = ""
 
 
@@ -329,12 +330,13 @@ async def async_request_openai_chat_completions(
             content.append(request_func_input.multi_modal_content)
         payload = {
             "model": request_func_input.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": content
-                },
-            ],
+            "messages": (
+                [
+                    {"role": "user", "content": content},
+                ]
+                if isinstance(request_func_input.prompt, str)
+                else request_func_input.prompt
+            ),
             "temperature": 0.0,
             "max_completion_tokens": request_func_input.output_len,
             "stream": True,
@@ -348,7 +350,7 @@ async def async_request_openai_chat_completions(
         }
 
         output = RequestFuncOutput()
-        output.prompt_len = request_func_input.prompt_len
+        # output.prompt_len = request_func_input.prompt_len
 
         generated_text = ""
         ttft = 0.0
@@ -370,22 +372,28 @@ async def async_request_openai_chat_completions(
                         else:
                             timestamp = time.perf_counter()
                             data = json.loads(chunk)
+                            if len(data["choices"]) > 0:
+                                delta = data["choices"][0]["delta"]
+                                if delta.get("content", None):
+                                    # First token
+                                    if ttft == 0.0:
+                                        ttft = time.perf_counter() - st
+                                        output.ttft = ttft
 
-                            delta = data["choices"][0]["delta"]
-                            if delta.get("content", None):
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                                    # Decoding phase
+                                    else:
+                                        output.itl.append(timestamp -
+                                                        most_recent_timestamp)
 
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp -
-                                                      most_recent_timestamp)
+                                    generated_text += delta["content"]
 
-                                generated_text += delta["content"]
-
-                            most_recent_timestamp = timestamp
+                                most_recent_timestamp = timestamp
+                            else:
+                                # This is a usage summary response
+                                prompt_tokens = data["usage"]["prompt_tokens"]
+                                completion_tokens = data["usage"]["completion_tokens"]
+                                output.prompt_len = prompt_tokens
+                                output.output_len = completion_tokens
 
                     output.generated_text = generated_text
                     output.success = True

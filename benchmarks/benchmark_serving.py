@@ -382,6 +382,23 @@ def sample_random_requests(
     return input_requests
 
 
+def sample_openai_chat_requests(
+    dataset_path: str,
+    num_requests: int,
+    output_len: int,
+    input_len: int = 1024,
+) -> List[Tuple[Any, int, int]]:
+    # Load the dataset.
+    with open(dataset_path) as f:
+        dataset = json.load(f)
+    dataset = [
+        (messages, input_len, output_len) for data in dataset for messages in data
+    ]
+    if num_requests > len(dataset):
+        return dataset
+    return random.sample(dataset, num_requests)
+
+
 async def get_request(
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
@@ -427,7 +444,7 @@ async def get_request(
 
 
 def calculate_metrics(
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: List[Tuple[Any, int, int]],
     outputs: List[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
@@ -450,11 +467,21 @@ def calculate_metrics(
             # serving backends instead of looking at len(outputs[i].itl) since
             # multiple output tokens may be bundled together
             # Note : this may inflate the output token count slightly
-            output_len = len(
-                tokenizer(outputs[i].generated_text,
-                          add_special_tokens=False).input_ids)
+            output_len = (
+                outputs[i].output_len
+                if outputs[i].output_len
+                else len(
+                    tokenizer(
+                        outputs[i].generated_text, add_special_tokens=False
+                    ).input_ids
+                )
+            )
             actual_output_lens.append(output_len)
-            total_input += input_requests[i][1]
+            total_input += (
+                input_requests[i][1]
+                if not outputs[i].prompt_len
+                else outputs[i].prompt_len
+            )
             tpot = 0
             if output_len > 1:
                 tpot = (outputs[i].latency - outputs[i].ttft) / (output_len -
@@ -536,7 +563,7 @@ async def benchmark(
     base_url: str,
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
-    input_requests: List[Tuple[str, int, int]],
+    input_requests: List[Tuple[Any, int, int]],
     logprobs: Optional[int],
     best_of: int,
     request_rate: float,
@@ -876,6 +903,16 @@ def main(args: argparse.Namespace):
             range_ratio=args.random_range_ratio,
             tokenizer=tokenizer,
         )
+    elif args.dataset_name == "openai-chat":
+        if args.backend != "openai-chat":
+            raise ValueError(
+                "The '--dataset-name openai-chat' argument is only valid for the 'openai-chat' backend."
+            )
+        input_requests = sample_openai_chat_requests(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            output_len=args.openai_chat_output_len,
+        )
 
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
@@ -985,7 +1022,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "sonnet", "random", "hf"],
+        choices=["sharegpt", "sonnet", "random", "hf", "openai-chat"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
@@ -1048,6 +1085,13 @@ if __name__ == "__main__":
               "is disabled, no logprobs are computed & a single dummy "
               "logprob is returned for each token; or (2) if beam search "
               "is enabled 1 logprob per token is computed"),
+    )
+    parser.add_argument(
+        "--openai-chat-output-len",
+        type=int,
+        default=128,
+        help=
+        "Number of output tokens per request, used only for openai-chat sampling.",
     )
     parser.add_argument(
         "--request-rate",
